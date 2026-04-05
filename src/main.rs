@@ -1,5 +1,6 @@
 use std::{
-    fs::File,
+    env::var,
+    fs::{File, exists},
     io::{BufRead, BufReader, Read},
     net::IpAddr,
 };
@@ -13,6 +14,8 @@ use ureq::{
 };
 
 const CONFIG_FILE: &str = "config.toml";
+const SYSTEM_CONFIG_FILE: &str = "/etc/cloudflare-ddns.toml";
+
 const CF_TRACE_URL: &str = "https://cloudflare.com/cdn-cgi/trace";
 const CF_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
 
@@ -183,7 +186,21 @@ fn get_public_ip() -> Result<Option<IpAddr>> {
 }
 
 fn load_config() -> Result<Config> {
-    let mut file = File::open(CONFIG_FILE)?;
+    let config_path = [
+        var("CONFIG_FILE").ok(),
+        Some(CONFIG_FILE.to_string()),
+        Some(SYSTEM_CONFIG_FILE.to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|path| exists(path).unwrap())
+    .next();
+
+    let mut file = if let Some(path) = config_path {
+        File::open(path)?
+    } else {
+        return Err(Error::msg("Config file not found"));
+    };
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
     let config = toml::from_slice(&buf)?;
