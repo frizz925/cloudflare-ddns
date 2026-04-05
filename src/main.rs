@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env::var,
     fs::{File, exists},
     io::{BufRead, BufReader, Read},
@@ -6,7 +7,6 @@ use std::{
 };
 
 use anyhow::{Error, Ok as _Ok, Result};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use ureq::{
     RequestBuilder,
@@ -26,15 +26,54 @@ struct Config {
     cf_zone_id: String,
 }
 
+#[derive(Deserialize)]
+struct ListApiResponse<R> {
+    result: Vec<R>,
+}
+
+#[derive(Deserialize)]
+struct DnsRecordsListResult {
+    id: String,
+    name: String,
+    #[serde(rename = "type")]
+    type_: String,
+    content: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DnsRecord {
+    name: String,
+    ttl: u32,
+    #[serde(rename = "type")]
+    type_: &'static str,
+    content: String,
+    proxied: bool,
+}
+
+impl DnsRecord {
+    fn new(name: &str, ip_addr: &IpAddr) -> Self {
+        Self {
+            name: name.to_string(),
+            ttl: 1,
+            type_: get_record_type(ip_addr),
+            content: ip_addr.to_string(),
+            proxied: false,
+        }
+    }
+
+    fn as_json(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self)
+    }
+}
+
+#[derive(Clone)]
 struct ApiClient {
     cf_api_key: String,
 }
 
 impl ApiClient {
-    fn new(config: &Config) -> Self {
-        Self {
-            cf_api_key: config.cf_api_key.clone(),
-        }
+    fn new(cf_api_key: String) -> Self {
+        Self { cf_api_key }
     }
 
     fn get<P>(&self, path: P) -> RequestBuilder<WithoutBody>
@@ -70,44 +109,69 @@ impl ApiClient {
     {
         format!("{}/{}", CF_API_BASE_URL, path.to_string().trim_matches('/'))
     }
-}
 
-#[derive(Deserialize)]
-struct DnsRecordsListResponse {
-    result: Vec<DnsRecordsListResult>,
-}
-
-#[derive(Deserialize)]
-struct DnsRecordsListResult {
-    id: String,
-    name: String,
-    #[serde(rename = "type")]
-    type_: String,
-}
-
-#[derive(Serialize)]
-struct DnsRecord {
-    name: String,
-    ttl: u32,
-    #[serde(rename = "type")]
-    type_: &'static str,
-    content: String,
-    proxied: bool,
-}
-
-impl DnsRecord {
-    fn new(name: &str, ip_addr: &IpAddr) -> Self {
-        Self {
-            name: name.to_string(),
-            ttl: 1,
-            type_: get_record_type(ip_addr),
-            content: ip_addr.to_string(),
-            proxied: false,
+    fn dns_records_api<S>(&self, zone_id: S) -> DnsRecordsApi
+    where
+        S: ToString,
+    {
+        DnsRecordsApi {
+            inner: self.clone(),
+            zone_id: zone_id.to_string(),
         }
     }
+}
 
-    fn into_json(self) -> serde_json::Result<String> {
-        serde_json::to_string(&self)
+struct DnsRecordsApi {
+    inner: ApiClient,
+    zone_id: String,
+}
+
+impl DnsRecordsApi {
+    fn _get<P>(&self, path: P) -> RequestBuilder<WithoutBody>
+    where
+        P: ToString,
+    {
+        self.inner.get(self.build_path(path))
+    }
+
+    fn _post<P>(&self, path: P) -> RequestBuilder<WithBody>
+    where
+        P: ToString,
+    {
+        self.inner.post(self.build_path(path))
+    }
+
+    fn _patch<P>(&self, path: P) -> RequestBuilder<WithBody>
+    where
+        P: ToString,
+    {
+        self.inner.patch(self.build_path(path))
+    }
+
+    fn list(&self) -> Result<Vec<DnsRecordsListResult>> {
+        let reader = self._get("").call()?.into_body().into_reader();
+        let response: ListApiResponse<DnsRecordsListResult> = serde_json::from_reader(reader)?;
+        Ok(response.result)
+    }
+
+    fn create(&self, record: &DnsRecord) -> Result<()> {
+        self._post("").send(record.as_json().unwrap())?;
+        Ok(())
+    }
+
+    fn update<S>(&self, id: S, record: &DnsRecord) -> Result<()>
+    where
+        S: ToString,
+    {
+        self._patch(id).send(record.as_json().unwrap())?;
+        Ok(())
+    }
+
+    fn build_path<P>(&self, path: P) -> String
+    where
+        P: ToString,
+    {
+        format!("zones/{}/dns_records/{}", self.zone_id, path.to_string())
     }
 }
 
@@ -119,56 +183,57 @@ fn main() -> Result<()> {
         return Err(Error::msg("Public IP not found"));
     };
     println!("Public IP: {}", public_ip);
-    let client = ApiClient::new(&config);
-    let results: Vec<Result<()>> = config
-        .dns_records
-        .par_iter()
-        .map(|dns_record| update_dns_record(&client, &config, public_ip, dns_record))
+
+    let client = ApiClient::new(config.cf_api_key).dns_records_api(config.cf_zone_id);
+    let records: HashMap<_, _> = client
+        .list()?
+        .into_iter()
+        .map(|r| (record_key(&r.name, &r.type_), r))
         .collect();
+    let results = config
+        .dns_records
+        .into_iter()
+        .flat_map(|name| {
+            let request = DnsRecord::new(&name, &public_ip);
+            if let Some(record) = records.get(&record_key(&name, request.type_)) {
+                if let Some(content) = record.content.as_deref() {
+                    if content
+                        .parse()
+                        .map(|ip: IpAddr| ip == public_ip)
+                        .unwrap_or_default()
+                    {
+                        // Record content matches, do nothing
+                        println!("DNS record {} matches", name);
+                        return None;
+                    }
+                }
+                // Record exists, update existing
+                let record_id = record.id.to_owned();
+                return Some((Some(record_id), request));
+            }
+            // Record doesn't exist, create a new one
+            Some((None, request))
+        })
+        .map(|(record_id, record)| {
+            if let Some(id) = record_id {
+                client.update(id, &record).map(|_| {
+                    println!("DNS record {} has been updated", record.name);
+                })
+            } else {
+                client.create(&record).map(|_| {
+                    println!("DNS record {} has been created", record.name);
+                })
+            }
+        });
     for result in results {
         result?;
     }
+
     _Ok(())
 }
 
-fn update_dns_record(
-    client: &ApiClient,
-    config: &Config,
-    public_ip: IpAddr,
-    dns_record: &str,
-) -> Result<()> {
-    let dns_base_url = format!("/zones/{}/dns_records", config.cf_zone_id);
-    let record_type = get_record_type(&public_ip);
-    let request_body = DnsRecord::new(dns_record, &public_ip).into_json().unwrap();
-    // Get list of records
-    let records = {
-        let reader = client
-            .get(&dns_base_url)
-            .query("type", record_type)
-            .query("name", dns_record)
-            .call()?
-            .into_body()
-            .into_reader();
-        let response: DnsRecordsListResponse = serde_json::from_reader(reader)?;
-        response.result
-    };
-    let record_id = records
-        .into_iter()
-        .filter(|r| r.name == dns_record && r.type_ == record_type)
-        .map(|r| r.id)
-        .next();
-    if let Some(record_id) = record_id {
-        // Update existing DNS record
-        client
-            .patch([dns_base_url, record_id].join("/"))
-            .send(request_body)?;
-        println!("DNS record {} has been updated", dns_record);
-    } else {
-        // Create new DNS record
-        client.post(&dns_base_url).send(request_body)?;
-        println!("DNS record {} has been created", dns_record);
-    }
-    Ok(())
+fn record_key(name: &str, type_: &str) -> String {
+    format!("{name}:{type_}")
 }
 
 fn get_public_ip() -> Result<Option<IpAddr>> {
