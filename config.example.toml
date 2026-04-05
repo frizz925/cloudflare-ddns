@@ -1,0 +1,3 @@
+dns_records = ["example.com"]
+cf_api_key = "CF_API_KEY"
+cf_zone_id = "CF_ZONE_ID"
